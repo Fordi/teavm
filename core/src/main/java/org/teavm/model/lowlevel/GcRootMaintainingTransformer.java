@@ -15,13 +15,21 @@
  */
 package org.teavm.model.lowlevel;
 
+import com.carrotsearch.hppc.IntArrayList;
 import com.carrotsearch.hppc.IntObjectMap;
 import com.carrotsearch.hppc.IntObjectOpenHashMap;
 import com.carrotsearch.hppc.cursors.ObjectCursor;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import org.teavm.common.DominatorTree;
 import org.teavm.common.Graph;
+import org.teavm.common.GraphBuilder;
+import org.teavm.common.GraphUtils;
 import org.teavm.interop.NoGC;
 import org.teavm.model.BasicBlock;
 import org.teavm.model.ClassReader;
@@ -44,6 +52,7 @@ import org.teavm.model.instructions.InvokeInstruction;
 import org.teavm.model.instructions.JumpInstruction;
 import org.teavm.model.instructions.RaiseInstruction;
 import org.teavm.model.util.DefinitionExtractor;
+import org.teavm.model.util.GraphColorer;
 import org.teavm.model.util.LivenessAnalyzer;
 import org.teavm.model.util.ProgramUtils;
 import org.teavm.model.util.TypeInferer;
@@ -63,11 +72,47 @@ public class GcRootMaintainingTransformer {
             return;
         }
         List<IntObjectMap<BitSet>> liveInInformation = findCallSiteLiveIns(program, method);
-        int maxDepth = putLiveInGcRoots(program, liveInInformation);
-        if (maxDepth > 0) {
-            addStackAllocation(program, maxDepth);
-            addStackRelease(program, maxDepth);
+
+        Graph interferenceGraph = buildInterferenceGraph(liveInInformation, program);
+        boolean[] spilled = getAffectedVariables(liveInInformation, program);
+        int[] colors = new int[interferenceGraph.size()];
+        new GraphColorer().colorize(interferenceGraph, colors);
+
+        int maxColor = -1;
+        for (int color : colors) {
+            if (spilled[color]) {
+                maxColor = Math.max(maxColor, color);
+            }
         }
+        if (maxColor < 0) {
+            return;
+        }
+        int usedColors = maxColor + 1;
+
+        // If a variable is spilled to stack, then phi which input this variable also spilled to stack
+        // If all of phi inputs are spilled to stack, then we don't need to insert spilling instruction
+        // for this phi.
+        List<Set<Phi>> destinationPhis = getDestinationPhis(program);
+        int[] inputCount = getInputCount(program);
+        boolean[] autoSpilled = new boolean[spilled.length];
+        for (int i = 0; i < spilled.length; ++i) {
+            if (spilled[i]) {
+                Set<Phi> phis = destinationPhis.get(i);
+                if (phis != null) {
+                    for (Phi phi : destinationPhis.get(i)) {
+                        int destination = phi.getReceiver().getIndex();
+                        spilled[destination] = true;
+                        autoSpilled[destination] = --inputCount[destination] == 0;
+                    }
+                }
+            }
+        }
+
+        List<IntObjectMap<BitSet>> liveInStores = reduceGcRootStores(program, usedColors, liveInInformation,
+                colors, autoSpilled);
+        putLiveInGcRoots(program, liveInInformation, liveInStores, colors);
+        addStackAllocation(program, usedColors);
+        addStackRelease(program, usedColors);
     }
 
     private List<IntObjectMap<BitSet>> findCallSiteLiveIns(Program program, MethodReader method) {
@@ -124,41 +169,187 @@ public class GcRootMaintainingTransformer {
         return liveInInformation;
     }
 
-    private int putLiveInGcRoots(Program program, List<IntObjectMap<BitSet>> liveInInformation) {
-        int maxDepth = 0;
-        for (IntObjectMap<BitSet> liveInsMap : liveInInformation) {
-            for (ObjectCursor<BitSet> liveIns : liveInsMap.values()) {
-                maxDepth = Math.max(maxDepth, liveIns.value.cardinality());
+    private Graph buildInterferenceGraph(List<IntObjectMap<BitSet>> liveInInformation, Program program) {
+        GraphBuilder builder = new GraphBuilder(program.variableCount());
+        for (IntObjectMap<BitSet> blockLiveIn : liveInInformation) {
+            for (ObjectCursor<BitSet> callSiteLiveIn : blockLiveIn.values()) {
+                BitSet liveVarsSet = callSiteLiveIn.value;
+                IntArrayList liveVars = new IntArrayList();
+                for (int i = liveVarsSet.nextSetBit(0); i >= 0; i = liveVarsSet.nextSetBit(i + 1)) {
+                    liveVars.add(i);
+                }
+                int[] liveVarArray = liveVars.toArray();
+                for (int i = 0; i < liveVarArray.length - 1; ++i) {
+                    for (int j = i + 1; i < liveVarArray.length; ++j) {
+                        builder.addEdge(liveVarArray[i], liveVarArray[j]);
+                    }
+                }
             }
         }
+        return builder.build();
+    }
+
+    private boolean[] getAffectedVariables(List<IntObjectMap<BitSet>> liveInInformation, Program program) {
+        boolean[] affectedVariables = new boolean[program.variableCount()];
+        for (IntObjectMap<BitSet> blockLiveIn : liveInInformation) {
+            for (ObjectCursor<BitSet> callSiteLiveIn : blockLiveIn.values()) {
+                BitSet liveVarsSet = callSiteLiveIn.value;
+                for (int i = liveVarsSet.nextSetBit(0); i >= 0; i = liveVarsSet.nextSetBit(i + 1)) {
+                    affectedVariables[i] = true;
+                }
+            }
+        }
+        return affectedVariables;
+    }
+
+    private List<Set<Phi>> getDestinationPhis(Program program) {
+        List<Set<Phi>> destinationPhis = new ArrayList<>();
+        destinationPhis.addAll(Collections.nCopies(program.variableCount(), null));
 
         for (int i = 0; i < program.basicBlockCount(); ++i) {
             BasicBlock block = program.basicBlockAt(i);
-            List<Instruction> instructions = block.getInstructions();
-            IntObjectMap<BitSet> liveInsByIndex = liveInInformation.get(i);
-            for (int j = instructions.size() - 1; j >= 0; --j) {
-                BitSet liveIns = liveInsByIndex.get(j);
-                if (liveIns == null) {
-                    continue;
+            for (Phi phi : block.getPhis()) {
+                for (Incoming incoming : phi.getIncomings()) {
+                    Set<Phi> phis = destinationPhis.get(incoming.getValue().getIndex());
+                    if (phis == null) {
+                        phis = new HashSet<>();
+                        destinationPhis.set(incoming.getValue().getIndex(), phis);
+                    }
+                    phis.add(phi);
                 }
-                storeLiveIns(block, j, liveIns, maxDepth);
             }
         }
-        return maxDepth;
+
+        return destinationPhis;
     }
 
-    private void storeLiveIns(BasicBlock block, int index, BitSet liveIns, int maxDepth) {
+    private int[] getInputCount(Program program) {
+        int[] inputCount = new int[program.variableCount()];
+
+        for (int i = 0; i < program.basicBlockCount(); ++i) {
+            BasicBlock block = program.basicBlockAt(i);
+            for (Phi phi : block.getPhis()) {
+                inputCount[phi.getReceiver().getIndex()] = phi.getIncomings().size();
+            }
+        }
+
+        return inputCount;
+    }
+
+    private List<IntObjectMap<BitSet>> reduceGcRootStores(Program program, int usedColors,
+            List<IntObjectMap<BitSet>> liveInInformation, int[] colors, boolean[] autoSpilled) {
+        class Step {
+            final int node;
+            int[] slotStates = new int[usedColors];
+            public Step(int node) {
+                this.node = node;
+            }
+        }
+
+        List<IntObjectMap<BitSet>> slotsToUpdate = new ArrayList<>();
+        for (int i = 0; i < program.basicBlockCount(); ++i) {
+            slotsToUpdate.add(new IntObjectOpenHashMap<>());
+        }
+
+        Graph cfg = ProgramUtils.buildControlFlowGraph(program);
+        DominatorTree dom = GraphUtils.buildDominatorTree(cfg);
+        Graph domGraph = GraphUtils.buildDominatorGraph(dom, cfg.size());
+
+        Step[] stack = new Step[program.basicBlockCount() * 2];
+        int head = 0;
+        Step start = new Step(0);
+        Arrays.fill(start.slotStates, -1);
+        stack[head++] = start;
+
+        while (head > 0) {
+            Step step = stack[--head];
+
+            int[] previousStates = step.slotStates;
+            int[] states = previousStates.clone();
+
+            IntObjectMap<BitSet> callSites = liveInInformation.get(step.node);
+            IntObjectMap<BitSet> updatesByCallSite = new IntObjectOpenHashMap<>();
+            int[] callSiteLocations = callSites.keys().toArray();
+            Arrays.sort(callSiteLocations);
+            for (int callSiteLocation : callSiteLocations) {
+                BitSet liveIns = callSites.get(callSiteLocation);
+                for (int liveVar = liveIns.nextSetBit(0); liveVar >= 0; liveVar = liveIns.nextSetBit(liveVar + 1)) {
+                    int slot = colors[liveVar];
+                    states[slot] = liveVar;
+                }
+                for (int slot = 0; slot < states.length; ++slot) {
+                    if (!liveIns.get(slot)) {
+                        states[slot] = -1;
+                    }
+                }
+
+                updatesByCallSite.put(callSiteLocation, compareStates(previousStates, states, autoSpilled));
+                previousStates = states;
+            }
+
+            for (int succ : domGraph.outgoingEdges(step.node)) {
+                Step next = new Step(succ);
+                System.arraycopy(states, 0, next.slotStates, 0, usedColors);
+                stack[head++] = next;
+            }
+        }
+
+        return slotsToUpdate;
+    }
+
+    private static BitSet compareStates(int[] oldStates, int[] newStates, boolean[] autoSpilled) {
+        BitSet changedStates = new BitSet();
+
+        for (int i = 0; i < oldStates.length; ++i) {
+            if (oldStates[i] != newStates[i]) {
+                changedStates.set(i);
+            }
+        }
+
+        for (int i = 0; i < newStates.length; ++i) {
+            if (autoSpilled[i]) {
+                changedStates.clear(i);
+            }
+        }
+
+        return changedStates;
+    }
+
+    private void putLiveInGcRoots(Program program, List<IntObjectMap<BitSet>> liveInInformation,
+            List<IntObjectMap<BitSet>> updateInformation, int[] colors) {
+        for (int i = 0; i < program.basicBlockCount(); ++i) {
+            BasicBlock block = program.basicBlockAt(i);
+            IntObjectMap<BitSet> liveInsByIndex = liveInInformation.get(i);
+            IntObjectMap<BitSet> updatesByIndex = updateInformation.get(i);
+            int[] callSiteLocations = liveInsByIndex.keys().toArray();
+            Arrays.sort(callSiteLocations);
+            for (int j = callSiteLocations.length - 1; j >= 0; --j) {
+                int callSiteLocation = callSiteLocations[j];
+                BitSet liveIns = liveInsByIndex.get(callSiteLocation);
+                BitSet updates = updatesByIndex.get(callSiteLocation);
+                if (updates.isEmpty()) {
+                    storeLiveIns(block, j, liveIns, updates, colors);
+                }
+            }
+        }
+    }
+
+    private void storeLiveIns(BasicBlock block, int index, BitSet liveIns, BitSet updates, int[] colors) {
         Program program = block.getProgram();
         List<Instruction> instructions = block.getInstructions();
         Instruction callInstruction = instructions.get(index);
         List<Instruction> instructionsToAdd = new ArrayList<>();
 
-        int slot = 0;
-        for (int liveVar = liveIns.nextSetBit(0); liveVar >= 0; liveVar = liveIns.nextSetBit(liveVar + 1)) {
+        for (int var = liveIns.nextSetBit(0); var >= 0; var = liveIns.nextSetBit(var + 1)) {
+            int slot = colors[var];
+            if (!updates.get(slot)) {
+                continue;
+            }
+
             Variable slotVar = program.createVariable();
             IntegerConstantInstruction slotConstant = new IntegerConstantInstruction();
             slotConstant.setReceiver(slotVar);
-            slotConstant.setConstant(slot++);
+            slotConstant.setConstant(slot);
             slotConstant.setLocation(callInstruction.getLocation());
             instructionsToAdd.add(slotConstant);
 
@@ -167,11 +358,13 @@ public class GcRootMaintainingTransformer {
             registerInvocation.setMethod(new MethodReference(Mutator.class, "registerGcRoot", int.class,
                     Object.class, void.class));
             registerInvocation.getArguments().add(slotVar);
-            registerInvocation.getArguments().add(program.variableAt(liveVar));
+            registerInvocation.getArguments().add(program.variableAt(var));
             instructionsToAdd.add(registerInvocation);
         }
 
-        while (slot < maxDepth) {
+        for (int slot = updates.nextSetBit(0); slot >= 0; slot = updates.nextSetBit(slot + 1)) {
+
+
             Variable slotVar = program.createVariable();
             IntegerConstantInstruction slotConstant = new IntegerConstantInstruction();
             slotConstant.setReceiver(slotVar);
