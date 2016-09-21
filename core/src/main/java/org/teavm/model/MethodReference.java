@@ -163,6 +163,7 @@ public class MethodReference {
 
     public String signatureToString() {
         StringBuilder sb = new StringBuilder();
+        if (signature.length == 0) { return "()"; }
         sb.append('(');
         for (int i = 0; i < signature.length - 1; ++i) {
             sb.append(signature[i].toString());
